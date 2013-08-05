@@ -1299,12 +1299,16 @@ class Net::LDAP::Connection #:nodoc:
   def bind_sasl(auth)
     mech, cred, chall = auth[:mechanism], auth[:initial_credential],
       auth[:challenge_response]
-    raise Net::LDAP::LdapError, "Invalid binding information" unless (mech && cred && chall)
+    raise Net::LDAP::LdapError, "Invalid binding information" unless (mech && chall)
 
     n = 0
     loop {
       msgid = next_msgid.to_ber
-      sasl = [mech.to_ber, cred.to_ber].to_ber_contextspecific(3)
+      if cred
+         sasl = [mech.to_ber, cred.to_ber].to_ber_contextspecific(3)
+      else
+         sasl = [mech.to_ber].to_ber_contextspecific(3)
+      end
       request = [LdapVersion.to_ber, "".to_ber, sasl].to_ber_appsequence(0)
       request_pkt = [msgid, request].to_ber_sequence
       @conn.write request_pkt
