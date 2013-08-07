@@ -13,6 +13,16 @@ module Net # :nodoc:
       HasOpenSSL = false
       # :startdoc:
     end
+    begin
+      require 'sasl'
+      ##
+      # Set to +true+ if SASL is available
+      HasSASL = true
+    rescue LoadError
+      # :stopdoc:
+      HasSASL = false
+      # :startdoc:
+    end
   end
 end
 require 'socket'
@@ -576,7 +586,8 @@ class Net::LDAP
                                                    :port => @port,
                                                    :encryption =>
                                                    @encryption)
-      @open_connection.bind(@auth)
+
+      conn_bind(@open_connection,@auth)
       yield self
     ensure
       @open_connection.close if @open_connection
@@ -650,7 +661,7 @@ class Net::LDAP
       begin
         conn = Net::LDAP::Connection.new(:host => @host, :port => @port,
                                          :encryption => @encryption)
-        if (@result = conn.bind(args[:auth] || @auth)).result_code == 0
+        if (@result = conn_bind(conn,args[:auth] || @auth)).result_code == 0
           @result = conn.search(args) { |entry|
             result_set << entry if result_set
             yield entry if block_given?
@@ -727,12 +738,12 @@ class Net::LDAP
   # instead of a String.
   def bind(auth = @auth)
     if @open_connection
-      @result = @open_connection.bind(auth)
+      @result = conn_bind(@open_connection,auth)
     else
       begin
         conn = Connection.new(:host => @host, :port => @port,
                               :encryption => @encryption)
-        @result = conn.bind(auth)
+        @result = conn_bind(conn,auth)
       ensure
         conn.close if conn
       end
@@ -740,6 +751,13 @@ class Net::LDAP
 
     @result.success?
   end
+
+  def conn_bind(conn, auth)
+    auth = auth.dup
+    auth[:host] = @host unless auth.include?(:host)
+    conn.bind(auth)
+  end
+  private :conn_bind
 
   # #bind_as is for testing authentication credentials.
   #
@@ -833,7 +851,7 @@ class Net::LDAP
       begin
         conn = Connection.new(:host => @host, :port => @port,
                               :encryption => @encryption)
-        if (@result = conn.bind(args[:auth] || @auth)).result_code == 0
+        if (@result = conn_bind(conn, args[:auth] || @auth)).result_code == 0
           @result = conn.add(args)
         end
       ensure
@@ -931,7 +949,7 @@ class Net::LDAP
       begin
         conn = Connection.new(:host => @host, :port => @port,
                               :encryption => @encryption)
-        if (@result = conn.bind(args[:auth] || @auth)).result_code == 0
+        if (@result = conn_bind(conn,args[:auth] || @auth)).result_code == 0
           @result = conn.modify(args)
         end
       ensure
@@ -1003,7 +1021,7 @@ class Net::LDAP
       begin
         conn = Connection.new(:host => @host, :port => @port,
                               :encryption => @encryption)
-        if (@result = conn.bind(args[:auth] || @auth)).result_code == 0
+        if (@result = conn_bind(conn,args[:auth] || @auth)).result_code == 0
           @result = conn.rename(args)
         end
       ensure
@@ -1031,7 +1049,7 @@ class Net::LDAP
       begin
         conn = Connection.new(:host => @host, :port => @port,
                               :encryption => @encryption)
-        if (@result = conn.bind(args[:auth] || @auth)).result_code == 0
+        if (@result = conn_bind(conn,args[:auth] || @auth)).result_code == 0
           @result = conn.delete(args)
         end
       ensure
@@ -1172,6 +1190,14 @@ class Net::LDAP::Connection #:nodoc:
     conn
   end
 
+  def self.wrap_with_sasl(io, securelayer_wrapper)
+    raise Net::LDAP::LdapError, "SASL library (gem ruby-sasl) is unavailable" unless Net::LDAP::HasSASL
+    conn = securelayer_wrapper.call(io)
+    conn.extend(Net::BER::BERParser)
+    conn.extend(SASL::Buffering)
+    conn.extend(GetbyteForSSLSocket) unless conn.respond_to?(:getbyte)
+  end
+
   #--
   # Helper method called only from new, and only after we have a
   # successfully-opened @conn instance variable, which is a TCP connection.
@@ -1276,14 +1302,22 @@ class Net::LDAP::Connection #:nodoc:
   end
 
   #--
-  # Required parameters: :mechanism, :initial_credential and
-  # :challenge_response
+  # Required parameters: :mechanism
+  #
+  # If ruby-sasl is avaiable, :host is used to setup digest-url and defaults to
+  # connection hostname. Also, for some mechs, the :username and :password are used.
+  # :initial_credential and :challenge_response are optional and filled by 
+  # setup_auth_sasl.
+  #
+  # If ruby-sasl is not avaiable, :initial_credential and :challenge_response
+  # are required.
+  #
+  # Initial credential is most likely a string. It's passed in the initial
+  # BindRequest that goes to the server. In some protocols, it may be empty
+  # or missing.
   #
   # Mechanism is a string value that will be passed in the SASL-packet's
   # "mechanism" field.
-  #
-  # Initial credential is most likely a string. It's passed in the initial
-  # BindRequest that goes to the server. In some protocols, it may be empty.
   #
   # Challenge-response is a Ruby proc that takes a single parameter and
   # returns an object that will typically be a string. The
@@ -1295,13 +1329,18 @@ class Net::LDAP::Connection #:nodoc:
   # times during the course of a SASL authentication, and each time it must
   # return a value that will be passed back to the server as the credential
   # data in the next BindRequest packet.
+  # 
   #++
   def bind_sasl(auth)
+    if not auth[:challenge_response]
+      auth = auth.merge(self.class.setup_auth_sasl(auth))
+    end
     mech, cred, chall = auth[:mechanism], auth[:initial_credential],
       auth[:challenge_response]
     raise Net::LDAP::LdapError, "Invalid binding information" unless (mech && chall)
 
     n = 0
+    securelayer_wrapper = nil
     loop {
       msgid = next_msgid.to_ber
       if cred
@@ -1314,46 +1353,41 @@ class Net::LDAP::Connection #:nodoc:
       @conn.write request_pkt
 
       (be = @conn.read_ber(Net::LDAP::AsnSyntax) and pdu = Net::LDAP::PDU.new(be)) or raise Net::LDAP::LdapError, "no bind result"
+      if securelayer_wrapper
+        $stderr.puts "secure lay"
+        @conn = self.class.wrap_with_sasl(@conn, securelayer_wrapper)   
+      end
       return pdu unless pdu.result_code == 14 # saslBindInProgress
       raise Net::LDAP::LdapError, "sasl-challenge overflow" if ((n += 1) > MaxSaslChallenges)
 
-      cred = chall.call(pdu.result_server_sasl_creds)
+      (cred, securelayer_wrapper) = chall.call(pdu.result_server_sasl_creds)
     }
 
     raise Net::LDAP::LdapError, "why are we here?"
   end
   private :bind_sasl
 
-  #--
-  # PROVISIONAL, only for testing SASL implementations. DON'T USE THIS YET.
-  # Uses Kohei Kajimoto's Ruby/NTLM. We have to find a clean way to
-  # integrate it without introducing an external dependency.
-  #
-  # This authentication method is accessed by calling #bind with a :method
-  # parameter of :gss_spnego. It requires :username and :password
-  # attributes, just like the :simple authentication method. It performs a
-  # GSS-SPNEGO authentication with the server, which is presumed to be a
-  # Microsoft Active Directory.
-  #++
-  def bind_gss_spnego(auth)
-    require 'ntlm'
+  SASL_SERVICE_NAME="ldap"
 
-    user, psw = [auth[:username] || auth[:dn], auth[:password]]
-    raise Net::LDAP::LdapError, "Invalid binding information" unless (user && psw)
+  def self.setup_auth_sasl(auth)
+    raise Net::LDAP::LdapError, "SASL library (gem ruby-sasl) is unavailable" unless Net::LDAP::HasSASL
+    raise Net::LDAP::LdapError, "Invalid binding information. auth[:host] is required" unless auth.include?(:host)
 
-    nego = proc { |challenge|
-      t2_msg = NTLM::Message.parse(challenge)
-      t3_msg = t2_msg.response({ :user => user, :password => psw },
-                               { :ntlmv2 => true })
-      t3_msg.serialize
-    }
+    pref = SASL::Preferences.new(
+        :digest_uri =>"#{SASL_SERVICE_NAME}/#{auth[:host]}",
+        :username => auth[:username] || auth[:dn],
+        :password => auth[:password],
+    )
+    sasl = SASL.new_mechanism(auth[:mechanism], pref)
 
-    bind_sasl(:method => :sasl, :mechanism => "GSS-SPNEGO",
-              :initial_credential => NTLM::Message::Type1.new.serialize,
-              :challenge_response => nego)
+    challenge_response = Proc.new do |cred|
+       response = sasl.receive("challenge", cred)
+       response[1]
+    end
+
+    initial_credential = sasl.start[1]
+    return {:initial_credential => initial_credential, :challenge_response=>challenge_response}
   end
-  private :bind_gss_spnego
-
 
   #--
   # Allow the caller to specify a sort control
