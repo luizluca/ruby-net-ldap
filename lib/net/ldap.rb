@@ -1306,8 +1306,10 @@ class Net::LDAP::Connection #:nodoc:
   #
   # If ruby-sasl is avaiable, :host is used to setup digest-url and defaults to
   # connection hostname. Also, for some mechs, the :username and :password are used.
+  # :secure_layer define if SASL should atempt to use secure layer (similar to SSL)
   # :initial_credential and :challenge_response are optional and filled by 
-  # setup_auth_sasl.
+  # setup_auth_sasl. Extra preferences for sasl library like :gss_opts be defined as
+  # a hash in :sasl_opts.
   #
   # If ruby-sasl is not avaiable, :initial_credential and :challenge_response
   # are required.
@@ -1353,36 +1355,54 @@ class Net::LDAP::Connection #:nodoc:
       @conn.write request_pkt
 
       (be = @conn.read_ber(Net::LDAP::AsnSyntax) and pdu = Net::LDAP::PDU.new(be)) or raise Net::LDAP::LdapError, "no bind result"
-      if securelayer_wrapper
-        $stderr.puts "secure lay"
-        @conn = self.class.wrap_with_sasl(@conn, securelayer_wrapper)   
-      end
-      return pdu unless pdu.result_code == 14 # saslBindInProgress
-      raise Net::LDAP::LdapError, "sasl-challenge overflow" if ((n += 1) > MaxSaslChallenges)
 
-      (cred, securelayer_wrapper) = chall.call(pdu.result_server_sasl_creds)
+      case pdu.result_code
+      when 14 # SASLBindInProgress
+        cred = chall.call(pdu.result_server_sasl_creds, :challenge)
+      when 0 # Authenticated
+        securelayer_wrapper = chall.call(pdu.result_server_sasl_creds, :success)
+        if securelayer_wrapper
+          @conn = self.class.wrap_with_sasl(@conn, securelayer_wrapper)   
+        end
+        return pdu
+      else # Error
+        chall.call(pdu.result_server_sasl_creds, :failure)
+        return pdu
+      end
+
+      raise Net::LDAP::LdapError, "sasl-challenge overflow" if ((n += 1) > MaxSaslChallenges)
     }
 
     raise Net::LDAP::LdapError, "why are we here?"
   end
   private :bind_sasl
 
-  SASL_SERVICE_NAME="ldap"
+  SASL_SERVICE_TYPE="ldap"
 
   def self.setup_auth_sasl(auth)
     raise Net::LDAP::LdapError, "SASL library (gem ruby-sasl) is unavailable" unless Net::LDAP::HasSASL
     raise Net::LDAP::LdapError, "Invalid binding information. auth[:host] is required" unless auth.include?(:host)
 
-    pref = SASL::Preferences.new(
-        :digest_uri =>"#{SASL_SERVICE_NAME}/#{auth[:host]}",
-        :username => auth[:username] || auth[:dn],
-        :password => auth[:password],
-    )
-    sasl = SASL.new_mechanism(auth[:mechanism], pref)
+    opts = {:digest_uri =>"#{SASL_SERVICE_TYPE}/#{auth[:host]}",
+            :username => auth[:username] || auth[:dn],
+            :password => auth[:password],
+            :secure_layer => auth[:secure_layer],
+            }
+    opts.merge!(auth[:sasl_opts]) if auth.include? :sasl_opts
 
-    challenge_response = Proc.new do |cred|
-       response = sasl.receive("challenge", cred)
-       response[1]
+    sasl = SASL.new_mechanism(auth[:mechanism], SASL::Preferences.new(opts))
+
+    challenge_response = Proc.new do |cred,result|
+      case result
+      when :challenge
+          response = sasl.receive("challenge", cred)
+          response[1]
+      when :success
+          response = sasl.receive("success", cred)
+          response[1] if response
+      when :failure
+          response = sasl.receive("failure", cred)
+      end
     end
 
     initial_credential = sasl.start[1]
